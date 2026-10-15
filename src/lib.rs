@@ -356,8 +356,7 @@ impl Writer {
                 TileInfo {
                     offset: 0,
                     compressed_size: 0,
-                    raw_size: 0,
-                    crc32c: 0
+                    crc32c: 0,
                 };
                 tile_count as usize
             ],
@@ -624,7 +623,7 @@ impl IndexBounds for Header {
             entry.offset < self.data_offset
                 || entry.offset.saturating_add(entry.compressed_size)
                     > self.data_offset.saturating_add(data_length)
-                || entry.raw_size == 0
+                || entry.compressed_size == 0
         })
     }
 }
@@ -674,7 +673,7 @@ pub mod python_api {
     }
 
     #[gen_stub_pyclass]
-    #[pyclass(name = "ImageInfo", frozen)]
+    #[pyclass(name = "ImageInfo", frozen, skip_from_py_object)]
     #[derive(Clone)]
     pub struct PyImageInfo {
         inner: ImageInfo,

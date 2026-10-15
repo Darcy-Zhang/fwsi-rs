@@ -9,6 +9,6 @@ fn main() -> pyo3_stub_gen::Result<()> {
         .filter(|line| !line.starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(path, format!("{content}\n"))?;
+    fs::write(path, format!("{}\n", content.trim()))?;
     Ok(())
 }
