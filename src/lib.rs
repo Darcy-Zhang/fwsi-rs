@@ -316,12 +316,8 @@ pub struct Writer {
 }
 
 impl Writer {
-    pub fn create<P: AsRef<Path>>(
-        path: P,
-        width: u64,
-        height: u64,
-        tile_size: u32,
-    ) -> Result<Self> {
+    pub fn create<P: AsRef<Path>>(path: P, width: u64, height: u64) -> Result<Self> {
+        let tile_size = DEFAULT_TILE_SIZE;
         if width == 0 || height == 0 || tile_size == 0 || tile_size > MAX_JPEG_DIMENSION {
             return Err(Error::InvalidFormat("image dimensions".to_string()));
         }
@@ -512,14 +508,7 @@ impl Reader {
         Ok(raw)
     }
 
-    pub fn read_tile(&self, x: u32, y: u32) -> Result<Vec<u8>> {
-        let id = self.tile_id(x, y)?;
-        let entry = self.inner.index[id];
-        let compressed = self.read_compressed(entry)?;
-        self.decode_tile_bytes(x, y, &compressed, entry)
-    }
-
-    pub fn read_region(&self, x: u64, y: u64, width: u32, height: u32) -> Result<Region> {
+    pub fn read(&self, x: u64, y: u64, width: u32, height: u32) -> Result<Region> {
         if width == 0
             || height == 0
             || x.checked_add(width as u64).is_none()
@@ -597,7 +586,10 @@ impl Reader {
         for id in 0..self.inner.header.info.tile_count {
             let x = (id as u32) % self.inner.header.info.tiles_x;
             let y = (id as u32) / self.inner.header.info.tiles_x;
-            hasher.update(&self.read_tile(x, y)?);
+            let entry = self.inner.index[id as usize];
+            let compressed = self.read_compressed(entry)?;
+            let decoded = self.decode_tile_bytes(x, y, &compressed, entry)?;
+            hasher.update(&decoded);
         }
         let actual = *hasher.finalize().as_bytes();
         if actual != self.inner.header.info.image_hash {
@@ -785,16 +777,15 @@ pub mod python_api {
     #[pymethods]
     impl PyWriter {
         #[staticmethod]
-        #[pyo3(signature = (path, width, height, tile_size=1024))]
+        #[pyo3(signature = (path, width, height))]
         fn create(
             path: String,
             width: u64,
             height: u64,
-            tile_size: u32,
         ) -> PyResult<Self> {
             Ok(Self {
                 inner: Some(
-                    Writer::create(path, width, height, tile_size).map_err(py_err)?,
+                    Writer::create(path, width, height).map_err(py_err)?,
                 ),
             })
         }
@@ -843,13 +834,8 @@ pub mod python_api {
                 inner: self.inner.info(),
             }
         }
-        fn read_tile<'py>(&self, py: Python<'py>, x: u32, y: u32) -> PyResult<Bound<'py, PyBytes>> {
-            let inner = self.inner.clone();
-            let data = py.detach(|| inner.read_tile(x, y).map_err(py_err))?;
-            Ok(PyBytes::new(py, &data))
-        }
         #[pyo3(signature = (x, y, width, height))]
-        fn read_region(
+        fn read(
             &self,
             py: Python<'_>,
             x: u64,
@@ -860,7 +846,7 @@ pub mod python_api {
             let inner = self.inner.clone();
             py.detach(|| {
                 inner
-                    .read_region(x, y, width, height)
+                    .read(x, y, width, height)
                     .map(|region| PyRegion { inner: region })
                     .map_err(py_err)
             })
