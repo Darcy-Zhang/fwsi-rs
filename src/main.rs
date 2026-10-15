@@ -22,11 +22,7 @@ fn main() -> fwsi::Result<()> {
             let info = reader.info();
             println!(
                 "width={} height={} tile_size={} tiles={}x{}",
-                info.width,
-                info.height,
-                info.tile_size,
-                info.tiles_x,
-                info.tiles_y
+                info.width, info.height, info.tile_size, info.tiles_x, info.tiles_y
             );
             println!("image_hash={}", info.image_hash_hex());
             println!("content_id={}", info.content_id());

@@ -16,7 +16,6 @@ required-features = ["python"]
 [features]
 default = []
 python = ["dep:pyo3", "dep:pyo3-stub-gen"]
-extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
 blake3 = "1.8.7"
