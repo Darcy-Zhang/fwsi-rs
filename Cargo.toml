@@ -1,0 +1,33 @@
+[package]
+name = "fwsi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fast Flat Whole-Slide Image archive format"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "fwsi"
+path = "src/main.rs"
+
+[[bin]]
+name = "stub_gen"
+path = "src/bin/stub_gen.rs"
+required-features = ["python"]
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:pyo3-stub-gen"]
+extension-module = ["python", "pyo3/extension-module"]
+
+[dependencies]
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+crc32c = "0.6"
+rayon = "1.11"
+rusty_jpeg = { version = "0.4.2", default-features = false, features = ["std", "platform_independent"] }
+thiserror = "2"
+pyo3 = { version = "0.27", optional = true, features = ["abi3-py310"] }
+pyo3-stub-gen = { version = "0.23", optional = true }
