@@ -2,19 +2,16 @@
 name = "fwsi"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 description = "Fast Flat Whole-Slide Image archive format"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "fwsi"
-path = "src/main.rs"
-
-[[bin]]
 name = "stub_gen"
-path = "src/bin/stub_gen.rs"
 required-features = ["python"]
 
 [features]
