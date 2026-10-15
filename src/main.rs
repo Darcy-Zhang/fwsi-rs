@@ -12,7 +12,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Info { path: PathBuf },
-    Verify { path: PathBuf },
 }
 
 fn main() -> fwsi::Result<()> {
@@ -31,10 +30,6 @@ fn main() -> fwsi::Result<()> {
             );
             println!("image_hash={}", info.image_hash_hex());
             println!("content_id={}", info.content_id());
-        }
-        Command::Verify { path } => {
-            let info = Reader::open(path)?.verify()?;
-            println!("{}", info.image_hash_hex());
         }
     }
     Ok(())

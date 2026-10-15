@@ -487,12 +487,6 @@ impl Reader {
         Ok((y * self.inner.header.info.tiles_x + x) as usize)
     }
 
-    fn read_compressed(&self, entry: TileInfo) -> Result<Vec<u8>> {
-        let mut bytes = vec![0u8; entry.compressed_size as usize];
-        read_at(&self.inner.file, &mut bytes, entry.offset)?;
-        Ok(bytes)
-    }
-
     fn decode_tile_bytes(
         &self,
         x: u32,
@@ -580,23 +574,6 @@ impl Reader {
         })
     }
 
-    pub fn verify(&self) -> Result<ImageInfo> {
-        let mut hasher = Hasher::new();
-        update_hash_context(&mut hasher, &self.inner.header.info);
-        for id in 0..self.inner.header.info.tile_count {
-            let x = (id as u32) % self.inner.header.info.tiles_x;
-            let y = (id as u32) / self.inner.header.info.tiles_x;
-            let entry = self.inner.index[id as usize];
-            let compressed = self.read_compressed(entry)?;
-            let decoded = self.decode_tile_bytes(x, y, &compressed, entry)?;
-            hasher.update(&decoded);
-        }
-        let actual = *hasher.finalize().as_bytes();
-        if actual != self.inner.header.info.image_hash {
-            return Err(Error::InvalidFormat("image hash mismatch".to_string()));
-        }
-        Ok(self.info())
-    }
 }
 
 trait ReadAtOffset {
@@ -848,15 +825,6 @@ pub mod python_api {
                 inner
                     .read(x, y, width, height)
                     .map(|region| PyRegion { inner: region })
-                    .map_err(py_err)
-            })
-        }
-        fn verify(&self, py: Python<'_>) -> PyResult<PyImageInfo> {
-            let inner = self.inner.clone();
-            py.detach(|| {
-                inner
-                    .verify()
-                    .map(|info| PyImageInfo { inner: info })
                     .map_err(py_err)
             })
         }
