@@ -22,11 +22,10 @@ fn main() -> fwsi::Result<()> {
             let reader = Reader::open(path)?;
             let info = reader.info();
             println!(
-                "width={} height={} tile_size={} jpeg_quality={} tiles={}x{}",
+                "width={} height={} tile_size={} tiles={}x{}",
                 info.width,
                 info.height,
                 info.tile_size,
-                info.jpeg_quality,
                 info.tiles_x,
                 info.tiles_y
             );

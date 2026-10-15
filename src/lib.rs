@@ -4,21 +4,20 @@ use rusty_jpeg::decode::{ColorTransform, Decoder, PixelFormat};
 use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 
 pub const MAGIC: [u8; 4] = *b"FWSI";
 pub const VERSION: u16 = 1;
 pub const HEADER_SIZE: usize = 128;
-pub const INDEX_ENTRY_SIZE: usize = 32;
+pub const INDEX_ENTRY_SIZE: usize = 20;
 pub const DEFAULT_TILE_SIZE: u32 = 1024;
-pub const DEFAULT_JPEG_QUALITY: u8 = 80;
 
 const CHANNELS: u8 = 3;
 const PIXEL_FORMAT_RGB8: u8 = 1;
 const COMPRESSION_JPEG: u8 = 2;
-const JPEG_SAMPLING_444: u8 = 1;
+const JPEG_QUALITY: u8 = 80;
 const MAX_JPEG_DIMENSION: u32 = u16::MAX as u32;
 const MAX_MERGED_READ: u64 = 8 * 1024 * 1024;
 const MAX_MERGED_GAP: u64 = 256 * 1024;
@@ -57,7 +56,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct TileInfo {
     pub offset: u64,
     pub compressed_size: u64,
-    pub raw_size: u64,
     pub crc32c: u32,
 }
 
@@ -69,7 +67,6 @@ pub struct ImageInfo {
     pub tiles_x: u32,
     pub tiles_y: u32,
     pub tile_count: u64,
-    pub jpeg_quality: u8,
     pub image_hash: [u8; 32],
 }
 
@@ -88,7 +85,6 @@ pub struct Region {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    pub stride: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -113,13 +109,11 @@ impl Header {
         out[28] = CHANNELS;
         out[29] = PIXEL_FORMAT_RGB8;
         out[30] = COMPRESSION_JPEG;
-        out[31] = JPEG_SAMPLING_444;
         out[32..36].copy_from_slice(&self.info.tiles_x.to_le_bytes());
         out[36..40].copy_from_slice(&self.info.tiles_y.to_le_bytes());
         out[40..48].copy_from_slice(&self.info.tile_count.to_le_bytes());
         out[48..56].copy_from_slice(&self.index_offset.to_le_bytes());
         out[56..60].copy_from_slice(&(INDEX_ENTRY_SIZE as u32).to_le_bytes());
-        out[60] = self.info.jpeg_quality;
         out[64..72].copy_from_slice(&self.index_length.to_le_bytes());
         out[72..80].copy_from_slice(&self.data_offset.to_le_bytes());
         out[80..112].copy_from_slice(&self.info.image_hash);
@@ -146,11 +140,7 @@ impl Header {
         let width = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let height = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let tile_size = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
-        if bytes[28] != CHANNELS
-            || bytes[29] != PIXEL_FORMAT_RGB8
-            || bytes[30] != COMPRESSION_JPEG
-            || bytes[31] != JPEG_SAMPLING_444
-        {
+        if bytes[28] != CHANNELS || bytes[29] != PIXEL_FORMAT_RGB8 || bytes[30] != COMPRESSION_JPEG {
             return Err(Error::InvalidFormat("encoding".to_string()));
         }
         let tiles_x = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
@@ -163,10 +153,6 @@ impl Header {
         }
         let index_length = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
         let data_offset = u64::from_le_bytes(bytes[72..80].try_into().unwrap());
-        let jpeg_quality = bytes[60];
-        if !(1..=100).contains(&jpeg_quality) {
-            return Err(Error::InvalidFormat("jpeg quality".to_string()));
-        }
         let index_crc32c = u32::from_le_bytes(bytes[112..116].try_into().unwrap());
         let image_hash = bytes[80..112].try_into().unwrap();
         if width == 0 || height == 0 || tile_size == 0 || tile_size > MAX_JPEG_DIMENSION {
@@ -188,7 +174,6 @@ impl Header {
             tiles_x,
             tiles_y,
             tile_count,
-            jpeg_quality,
             image_hash,
         };
         if tile_count != tiles_x as u64 * tiles_y as u64
@@ -219,36 +204,33 @@ fn tile_dimensions(info: &ImageInfo, x: u32, y: u32) -> (u32, u32) {
 }
 
 fn update_hash_context(hasher: &mut Hasher, info: &ImageInfo) {
-    hasher.update(b"FWSI\x01JPEG-RGB8\x00");
+    hasher.update(b"FWSI\x01JPEG-RGB8-444\x00");
     hasher.update(&info.width.to_le_bytes());
     hasher.update(&info.height.to_le_bytes());
     hasher.update(&info.tile_size.to_le_bytes());
-    hasher.update(&[info.jpeg_quality, JPEG_SAMPLING_444]);
 }
 
 fn put_index_entry(out: &mut [u8], entry: TileInfo) {
     out[0..8].copy_from_slice(&entry.offset.to_le_bytes());
     out[8..16].copy_from_slice(&entry.compressed_size.to_le_bytes());
-    out[16..24].copy_from_slice(&entry.raw_size.to_le_bytes());
-    out[24..28].copy_from_slice(&entry.crc32c.to_le_bytes());
+    out[16..20].copy_from_slice(&entry.crc32c.to_le_bytes());
 }
 
 fn get_index_entry(bytes: &[u8]) -> TileInfo {
     TileInfo {
         offset: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
         compressed_size: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-        raw_size: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-        crc32c: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+        crc32c: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
     }
 }
 
-fn encode_jpeg(raw: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>> {
+fn encode_jpeg(raw: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     let width = u16::try_from(width)
         .map_err(|_| Error::Compression("tile width exceeds JPEG limit".to_string()))?;
     let height = u16::try_from(height)
         .map_err(|_| Error::Compression("tile height exceeds JPEG limit".to_string()))?;
     let mut encoded = Vec::new();
-    let mut encoder = Encoder::new(&mut encoded, quality);
+    let mut encoder = Encoder::new(&mut encoded, JPEG_QUALITY);
     // Pathology RGB tiles contain meaningful stain/color boundaries. Keep the
     // chroma plane at full resolution instead of the encoder's default 4:2:0.
     encoder.set_sampling_factor(SamplingFactor::F_1_1);
@@ -326,32 +308,22 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 
 pub struct Writer {
     file: File,
-    path: PathBuf,
     info: ImageInfo,
     index: Vec<TileInfo>,
     data_offset: u64,
     next_tile: u64,
     hasher: Hasher,
-    jpeg_quality: u8,
 }
 
 impl Writer {
-    pub fn create<P: AsRef<Path>>(path: P, width: u64, height: u64) -> Result<Self> {
-        Self::create_with_options(path, width, height, DEFAULT_TILE_SIZE, DEFAULT_JPEG_QUALITY)
-    }
-
-    pub fn create_with_options<P: AsRef<Path>>(
+    pub fn create<P: AsRef<Path>>(
         path: P,
         width: u64,
         height: u64,
         tile_size: u32,
-        jpeg_quality: u8,
     ) -> Result<Self> {
         if width == 0 || height == 0 || tile_size == 0 || tile_size > MAX_JPEG_DIMENSION {
             return Err(Error::InvalidFormat("image dimensions".to_string()));
-        }
-        if !(1..=100).contains(&jpeg_quality) {
-            return Err(Error::InvalidFormat("jpeg quality".to_string()));
         }
         let tiles_x = u32::try_from(width.div_ceil(tile_size as u64))
             .map_err(|_| Error::InvalidFormat("image dimensions".to_string()))?;
@@ -368,7 +340,6 @@ impl Writer {
             tiles_x,
             tiles_y,
             tile_count,
-            jpeg_quality,
             image_hash: [0; 32],
         };
         let mut file = OpenOptions::new()
@@ -384,7 +355,6 @@ impl Writer {
         update_hash_context(&mut hasher, &info);
         Ok(Self {
             file,
-            path: path.as_ref().to_path_buf(),
             info,
             index: vec![
                 TileInfo {
@@ -398,12 +368,7 @@ impl Writer {
             data_offset,
             next_tile: 0,
             hasher,
-            jpeg_quality,
         })
-    }
-
-    pub fn info(&self) -> &ImageInfo {
-        &self.info
     }
 
     pub fn write_tile(&mut self, x: u32, y: u32, raw: &[u8]) -> Result<()> {
@@ -425,7 +390,7 @@ impl Writer {
                 expected,
             });
         }
-        let compressed = encode_jpeg(raw, width, height, self.jpeg_quality)?;
+        let compressed = encode_jpeg(raw, width, height)?;
         // JPEG is lossy, so the canonical image stream is the RGB data that a
         // reader receives after decoding this tile, not the pre-encode input.
         let decoded = decode_jpeg(&compressed, width, height)?;
@@ -434,7 +399,6 @@ impl Writer {
         self.index[id as usize] = TileInfo {
             offset,
             compressed_size: compressed.len() as u64,
-            raw_size: decoded.len() as u64,
             crc32c: crc32c::crc32c(&decoded),
         };
         self.hasher.update(&decoded);
@@ -472,9 +436,6 @@ impl Writer {
         Ok(self.info)
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 struct ReaderInner {
@@ -523,11 +484,6 @@ impl Reader {
         self.inner.header.info
     }
 
-    pub fn tile_info(&self, x: u32, y: u32) -> Result<TileInfo> {
-        let id = self.tile_id(x, y)?;
-        Ok(self.inner.index[id])
-    }
-
     fn tile_id(&self, x: u32, y: u32) -> Result<usize> {
         if x >= self.inner.header.info.tiles_x || y >= self.inner.header.info.tiles_y {
             return Err(Error::TileOutOfBounds);
@@ -549,14 +505,7 @@ impl Reader {
         entry: TileInfo,
     ) -> Result<Vec<u8>> {
         let (width, height) = tile_dimensions(&self.inner.header.info, x, y);
-        let expected_raw_size = width as usize * height as usize * 3;
-        if entry.raw_size != expected_raw_size as u64 {
-            return Err(Error::InvalidFormat("tile raw size".to_string()));
-        }
         let raw = decode_jpeg(compressed, width, height)?;
-        if raw.len() != entry.raw_size as usize {
-            return Err(Error::InvalidFormat("tile raw size".to_string()));
-        }
         if crc32c::crc32c(&raw) != entry.crc32c {
             return Err(Error::ChecksumMismatch);
         }
@@ -639,7 +588,6 @@ impl Reader {
             data: output,
             width,
             height,
-            stride: stride as u32,
         })
     }
 
@@ -791,10 +739,6 @@ pub mod python_api {
             self.inner.tile_count
         }
         #[getter]
-        fn jpeg_quality(&self) -> u8 {
-            self.inner.jpeg_quality
-        }
-        #[getter]
         fn image_hash<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
             PyBytes::new(py, &self.inner.image_hash)
         }
@@ -829,10 +773,6 @@ pub mod python_api {
         fn height(&self) -> u32 {
             self.inner.height
         }
-        #[getter]
-        fn stride(&self) -> u32 {
-            self.inner.stride
-        }
     }
 
     #[gen_stub_pyclass]
@@ -845,18 +785,16 @@ pub mod python_api {
     #[pymethods]
     impl PyWriter {
         #[staticmethod]
-        #[pyo3(signature = (path, width, height, tile_size=1024, jpeg_quality=80))]
+        #[pyo3(signature = (path, width, height, tile_size=1024))]
         fn create(
             path: String,
             width: u64,
             height: u64,
             tile_size: u32,
-            jpeg_quality: u8,
         ) -> PyResult<Self> {
             Ok(Self {
                 inner: Some(
-                    Writer::create_with_options(path, width, height, tile_size, jpeg_quality)
-                        .map_err(py_err)?,
+                    Writer::create(path, width, height, tile_size).map_err(py_err)?,
                 ),
             })
         }
