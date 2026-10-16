@@ -1,7 +1,7 @@
 use std::fs;
 
 fn main() -> pyo3_stub_gen::Result<()> {
-    fwsi::python_api::stub_info()?.generate()?;
+    fwsi::python::stub_info()?.generate()?;
     let path = "fwsi.pyi";
     let content = fs::read_to_string(path)?;
     let content = content
