@@ -1,14 +1,14 @@
 # fwsi
 
-`fwsi`（Flat Whole-Slide Image）是一个面向科研图像归档的轻量库，提供 Rust 库和 Python 包，用于写入和读取 RGB 图像归档。
+`fwsi` (Flat Whole-Slide Image) is a lightweight archive library for research imaging. It provides a Rust library and a Python package for writing and reading RGB image archives.
 
-它主要服务于这样的工作流：从 WSI 读取 level 0 图像，转换为 RGB 数据，保存为尽可能紧凑的单文件归档，并在后续分析中高速随机读取局部区域。项目关注归档体积、局部读取速度和简单的跨语言使用方式，适合论文研究、图像分析和批处理任务。
+It targets a workflow where a WSI level 0 image is read as RGB data, stored in a compact single-file archive, and later accessed through fast random reads of local regions. The project focuses on archive size, region-read performance, and a simple interface that can be used from both Rust and Python.
 
-项目通过 Rust 或 Python API 使用，不提供命令行入口。
+The project is used through its Rust or Python API and does not provide a command-line interface.
 
-## Python 安装
+## Python installation
 
-从 Git 仓库安装：
+Install from a Git repository:
 
 ```bash
 python3.13 -m venv .venv
@@ -16,16 +16,16 @@ python3.13 -m venv .venv
 .venv/bin/python -m pip install "git+https://github.com/OWNER/REPOSITORY.git"
 ```
 
-从本地源码安装：
+Install from a local checkout:
 
 ```bash
 python3.13 -m venv .venv
 .venv/bin/python -m pip install .
 ```
 
-从源码安装 Python 包需要 Python 3.13 或更高版本、Rust stable、Cargo 和系统编译工具链。构建系统会自动安装 Maturin。
+Building the Python package from source requires Python 3.13 or newer, Rust stable, Cargo, and a system build toolchain. The build system installs Maturin automatically.
 
-安装后可以这样使用：
+Example:
 
 ```python
 from pathlib import Path
@@ -46,16 +46,16 @@ assert (region.width, region.height) == (1, 1)
 assert len(region.data) == region.width * region.height * 3
 ```
 
-## Rust 安装
+## Rust installation
 
-在另一个 Cargo 项目中添加 Git 依赖：
+Add the Git dependency to another Cargo project:
 
 ```toml
 [dependencies]
 fwsi = { git = "https://github.com/OWNER/REPOSITORY.git" }
 ```
 
-Rust 使用示例：
+Example:
 
 ```rust
 use fwsi::{Reader, Writer};
@@ -71,16 +71,19 @@ fn main() -> fwsi::Result<()> {
     let reader = Reader::open(path)?;
     let info = reader.info();
     let region = reader.read(0, 0, 1, 1)?;
-    assert_eq!(region.data.len(), region.width as usize * region.height as usize * 3);
+    assert_eq!(
+        region.data.len(),
+        region.width as usize * region.height as usize * 3
+    );
     println!("{}x{}", info.width, info.height);
 
     Ok(())
 }
 ```
 
-## 写入图像
+## Writing images
 
-图像使用 RGB8 字节，像素按行连续排列，每个像素占 3 个字节。tile 尺寸固定为 `1024 × 1024`；右侧和底部的边缘 tile 使用实际剩余宽高。tile 按从上到下、从左到右的顺序写入：
+Image data uses RGB8 bytes in row-major order, with 3 bytes per pixel. Tiles are fixed at `1024 x 1024`; rightmost and bottommost tiles use their actual remaining dimensions. Write tiles from top to bottom and from left to right:
 
 ```text
 for tile_y from 0 to tiles_y - 1:
@@ -88,13 +91,13 @@ for tile_y from 0 to tiles_y - 1:
         writer.write_tile(tile_x, tile_y, rgb_bytes)
 ```
 
-每个 tile 的数据长度必须是：
+The length of each tile buffer must be:
 
 ```text
-tile_width × tile_height × 3
+tile_width x tile_height x 3
 ```
 
-## 读取图像
+## Reading images
 
 ```python
 reader = fwsi.open("example.fwsi")
@@ -103,13 +106,13 @@ region = reader.read(x, y, width, height)
 rgb = region.data
 ```
 
-`region.data` 是连续排列的 RGB8 字节，长度为：
+`region.data` contains tightly packed RGB8 bytes with this length:
 
 ```text
-width × height × 3
+width x height x 3
 ```
 
-Rust 对应的接口是：
+The equivalent Rust API is:
 
 ```rust
 let reader = fwsi::Reader::open("example.fwsi")?;
@@ -117,4 +120,4 @@ let info = reader.info();
 let region = reader.read(x, y, width, height)?;
 ```
 
-`ImageInfo` 提供图像尺寸、tile 网格、整体 hash 和内容 ID。`Region` 提供 RGB 数据、宽度和高度。
+`ImageInfo` provides image dimensions, the tile grid, the image hash, and the content ID. `Region` provides RGB data, width, and height.
