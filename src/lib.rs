@@ -244,7 +244,7 @@ fn encode_jpeg(raw: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
 fn decode_jpeg(compressed: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     let mut decoder = Decoder::new(compressed);
     decoder.set_single_threaded(true);
-    decoder.set_color_transform(ColorTransform::RGB);
+    decoder.set_color_transform(ColorTransform::YCbCr);
     let raw = decoder
         .decode()
         .map_err(|error| Error::Decompression(error.to_string()))?;
@@ -641,6 +641,26 @@ fn base32_lower(bytes: &[u8]) -> String {
         out.push(TABLE[((buffer << (5 - bits)) & 31) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_jpeg, encode_jpeg};
+
+    #[test]
+    fn jpeg_rgb_round_trip() {
+        for expected in [[255u8, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]] {
+            let mut input = Vec::with_capacity(32 * 32 * 3);
+            for _ in 0..(32 * 32) {
+                input.extend_from_slice(&expected);
+            }
+            let compressed = encode_jpeg(&input, 32, 32).unwrap();
+            let decoded = decode_jpeg(&compressed, 32, 32).unwrap();
+            for (actual, expected) in decoded[..3].iter().zip(expected) {
+                assert!((*actual as i16 - expected as i16).abs() <= 5);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "python")]
