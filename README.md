@@ -11,7 +11,7 @@ The project is used through its Rust or Python API and does not provide a comman
 Add the Git dependency to a uv project:
 
 ```bash
-uv add git+https://github.com/OWNER/REPOSITORY.git
+uv add git+https://github.com/Darcy-Zhang/fwsi-rs.git
 ```
 
 This updates `pyproject.toml` and `uv.lock`. The relevant entries are:
@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-fwsi = { git = "https://github.com/OWNER/REPOSITORY.git" }
+fwsi = { git = "https://github.com/Darcy-Zhang/fwsi-rs.git" }
 ```
 
 If `pyproject.toml` is edited manually, use the same entries and then sync the project:
@@ -67,7 +67,7 @@ Add the Git dependency to another Cargo project:
 
 ```toml
 [dependencies]
-fwsi = { git = "https://github.com/OWNER/REPOSITORY.git" }
+fwsi = { git = "https://github.com/Darcy-Zhang/fwsi-rs.git" }
 ```
 
 Example:
