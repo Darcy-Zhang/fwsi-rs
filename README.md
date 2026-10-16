@@ -8,22 +8,37 @@ The project is used through its Rust or Python API and does not provide a comman
 
 ## Python installation
 
-Install from a Git repository:
+Add the Git dependency to a uv project:
 
 ```bash
-python3.13 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install "git+https://github.com/OWNER/REPOSITORY.git"
+uv add git+https://github.com/OWNER/REPOSITORY.git
 ```
 
-Install from a local checkout:
+This updates `pyproject.toml` and `uv.lock`. The relevant entries are:
+
+```toml
+[project]
+dependencies = [
+    "fwsi",
+]
+
+[tool.uv.sources]
+fwsi = { git = "https://github.com/OWNER/REPOSITORY.git" }
+```
+
+If `pyproject.toml` is edited manually, use the same entries and then sync the project:
 
 ```bash
-python3.13 -m venv .venv
-.venv/bin/python -m pip install .
+uv sync
 ```
 
-Building the Python package from source requires Python 3.13 or newer, Rust stable, Cargo, and a system build toolchain. The build system installs Maturin automatically.
+Run Python code in the managed environment with:
+
+```bash
+uv run python your_script.py
+```
+
+The Git installation builds the extension and requires Python 3.13 or newer, Rust stable, Cargo, and a system build toolchain. uv installs Maturin through the build system.
 
 Example:
 
