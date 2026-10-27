@@ -38,7 +38,7 @@ Run Python code in the managed environment with:
 uv run python your_script.py
 ```
 
-The Git installation builds the extension and requires Python 3.13 or newer, Rust stable, Cargo, and a system build toolchain. uv installs Maturin through the build system.
+The Git installation builds the extension and requires Python 3.10 or newer, Rust stable, Cargo, and a system build toolchain. uv installs Maturin through the build system.
 
 Example:
 
@@ -98,7 +98,7 @@ fn main() -> fwsi::Result<()> {
 
 ## Writing images
 
-Image data uses RGB8 bytes in row-major order, with 3 bytes per pixel. Tiles are fixed at `1024 x 1024`; rightmost and bottommost tiles use their actual remaining dimensions. Write tiles from top to bottom and from left to right:
+Image data uses RGB8 bytes in row-major order, with 3 bytes per pixel. Each archive uses one tile size, which defaults to `1024 x 1024` and can be selected when creating the archive. Write tiles from top to bottom and from left to right:
 
 ```text
 for tile_y from 0 to tiles_y - 1:
@@ -106,11 +106,58 @@ for tile_y from 0 to tiles_y - 1:
         writer.write_tile(tile_x, tile_y, rgb_bytes)
 ```
 
+Python can select the archive tile size with `tile_size`:
+
+```python
+writer = fwsi.Writer.create("example.fwsi", image_width, image_height, tile_size=256)
+```
+
+Rust can select it with:
+
+```rust
+let mut writer = fwsi::Writer::create_with_tile_size(
+    "example.fwsi",
+    image_width,
+    image_height,
+    256,
+)?;
+```
+
 The length of each tile buffer must be:
 
 ```text
 tile_width x tile_height x 3
 ```
+
+When JPEG tiles are already encoded, convert the complete tile grid with the RGB reference:
+
+```python
+info = fwsi.Writer.create_from_jpeg_tiles(
+    "output.fwsi",
+    image_width,
+    image_height,
+    tile_size,
+    tiles,
+    rgb_bytes,
+)
+```
+
+`tiles[y][x]` contains one JPEG tile as `bytes`. `rgb_bytes` is the expected decoded result for the complete logical image in tightly packed RGB8 order, not the pre-JPEG source pixels. Each decoded JPEG tile is checked against its corresponding RGB pixels before the archive is finalized. Edge padding is ignored during comparison and reads are cropped to the original image dimensions.
+
+The equivalent Rust call is:
+
+```rust
+let info = fwsi::Writer::create_from_jpeg_tiles(
+    "output.fwsi",
+    image_width,
+    image_height,
+    tile_size,
+    &tiles,
+    &rgb_bytes,
+)?;
+```
+
+The archive keeps the supplied JPEG bytes and does not encode them again. Interior blocks must use the archive tile size. Edge blocks may use either their visible dimensions or the full padded tile dimensions.
 
 ## Reading images
 

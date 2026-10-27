@@ -1,5 +1,5 @@
 use super::*;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_stub_gen::{
@@ -8,7 +8,10 @@ use pyo3_stub_gen::{
 };
 
 fn py_err(error: Error) -> PyErr {
-    PyValueError::new_err(error.to_string())
+    match error {
+        Error::Io(error) => PyOSError::new_err(error.to_string()),
+        error => PyValueError::new_err(error.to_string()),
+    }
 }
 
 #[gen_stub_pyclass]
@@ -91,11 +94,39 @@ pub struct PyWriter {
 #[pymethods]
 impl PyWriter {
     #[staticmethod]
-    #[pyo3(signature = (path, width, height))]
-    fn create(path: String, width: u64, height: u64) -> PyResult<Self> {
+    #[pyo3(signature = (path, width, height, tile_size=1024))]
+    fn create(path: String, width: u64, height: u64, tile_size: u32) -> PyResult<Self> {
         Ok(Self {
-            inner: Some(Writer::create(path, width, height).map_err(py_err)?),
+            inner: Some(
+                Writer::create_with_tile_size(path, width, height, tile_size).map_err(py_err)?,
+            ),
         })
+    }
+    #[staticmethod]
+    #[pyo3(signature = (path, width, height, tile_size, tiles, rgb))]
+    fn create_from_jpeg_tiles(
+        py: Python<'_>,
+        path: String,
+        width: u64,
+        height: u64,
+        tile_size: u32,
+        tiles: Vec<Vec<Py<PyBytes>>>,
+        rgb: &Bound<'_, PyBytes>,
+    ) -> PyResult<PyImageInfo> {
+        let tiles = tiles
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|tile| tile.bind(py).as_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let rgb = rgb.as_bytes().to_vec();
+        let info = py.detach(|| {
+            Writer::create_from_jpeg_tiles(path, width, height, tile_size, &tiles, &rgb)
+                .map_err(py_err)
+        })?;
+        Ok(PyImageInfo { inner: info })
     }
     fn write_tile(
         &mut self,

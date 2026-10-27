@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "fwsi"
 dynamic = ["version"]
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 
 [tool.maturin]
 features = ["python"]

@@ -2,9 +2,9 @@ use blake3::Hasher;
 use rayon::prelude::*;
 use rusty_jpeg::decode::{ColorTransform, Decoder, PixelFormat};
 use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -18,6 +18,7 @@ const CHANNELS: u8 = 3;
 const PIXEL_FORMAT_RGB8: u8 = 1;
 const COMPRESSION_JPEG: u8 = 2;
 const JPEG_QUALITY: u8 = 80;
+const MAX_TILE_SIZE: u32 = u16::MAX as u32;
 const MAX_MERGED_READ: u64 = 8 * 1024 * 1024;
 const MAX_MERGED_GAP: u64 = 256 * 1024;
 
@@ -35,6 +36,24 @@ pub enum Error {
     InvalidTileLength { actual: usize, expected: usize },
     #[error("tile write order is {actual}, expected {expected}")]
     InvalidTileOrder { actual: u64, expected: u64 },
+    #[error(
+        "tile grid has {actual_rows} rows, expected {expected_rows} with {expected_columns} columns"
+    )]
+    InvalidTileGrid {
+        actual_rows: usize,
+        expected_rows: u32,
+        expected_columns: u32,
+    },
+    #[error("tile row {row} has {actual_columns} columns, expected {expected_columns}")]
+    InvalidTileRow {
+        row: usize,
+        actual_columns: usize,
+        expected_columns: u32,
+    },
+    #[error("RGB data has length {actual}, expected {expected}")]
+    InvalidRgbLength { actual: usize, expected: usize },
+    #[error("tile RGB data does not match at ({x}, {y})")]
+    TileRgbMismatch { x: u32, y: u32 },
     #[error("tile checksum mismatch")]
     ChecksumMismatch,
     #[error("header checksum mismatch")]
@@ -154,7 +173,7 @@ impl Header {
         let data_offset = u64::from_le_bytes(bytes[72..80].try_into().unwrap());
         let index_crc32c = u32::from_le_bytes(bytes[112..116].try_into().unwrap());
         let image_hash = bytes[80..112].try_into().unwrap();
-        if width == 0 || height == 0 || tile_size != DEFAULT_TILE_SIZE {
+        if width == 0 || height == 0 || tile_size == 0 || tile_size > MAX_TILE_SIZE {
             return Err(Error::InvalidFormat("tile index dimensions".to_string()));
         }
         let expected_tiles_x = width.div_ceil(tile_size as u64);
@@ -205,6 +224,61 @@ fn tile_dimensions(info: &ImageInfo, x: u32, y: u32) -> (u32, u32) {
     (w, h)
 }
 
+fn valid_tile_dimensions(info: &ImageInfo, x: u32, y: u32, width: u32, height: u32) -> bool {
+    let (visible_width, visible_height) = tile_dimensions(info, x, y);
+    (width == visible_width || width == info.tile_size)
+        && (height == visible_height || height == info.tile_size)
+}
+
+fn expected_rgb_length(info: &ImageInfo) -> Result<usize> {
+    let pixels = info
+        .width
+        .checked_mul(info.height)
+        .ok_or_else(|| Error::InvalidFormat("RGB dimensions".to_string()))?;
+    let length = pixels
+        .checked_mul(3)
+        .ok_or_else(|| Error::InvalidFormat("RGB dimensions".to_string()))?;
+    usize::try_from(length).map_err(|_| Error::InvalidFormat("RGB dimensions".to_string()))
+}
+
+fn tile_matches_rgb(
+    info: &ImageInfo,
+    x: u32,
+    y: u32,
+    decoded: &[u8],
+    stored_width: u32,
+    rgb: &[u8],
+) -> Result<bool> {
+    let (visible_width, visible_height) = tile_dimensions(info, x, y);
+    let image_width = usize::try_from(info.width)
+        .map_err(|_| Error::InvalidFormat("RGB dimensions".to_string()))?;
+    let tile_origin_x = x as usize * info.tile_size as usize;
+    let tile_origin_y = y as usize * info.tile_size as usize;
+    let stored_stride = stored_width as usize * 3;
+    let visible_row_length = visible_width as usize * 3;
+    for row in 0..visible_height as usize {
+        let decoded_start = row * stored_stride;
+        let rgb_start = ((tile_origin_y + row) * image_width + tile_origin_x) * 3;
+        if decoded[decoded_start..decoded_start + visible_row_length]
+            != rgb[rgb_start..rgb_start + visible_row_length]
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut temporary = path.as_os_str().to_os_string();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    temporary.push(format!(".fwsi-{}-{}", std::process::id(), stamp));
+    PathBuf::from(temporary)
+}
+
 fn update_hash_context(hasher: &mut Hasher, info: &ImageInfo) {
     hasher.update(b"FWSI\x01JPEG-RGB8-444\x00");
     hasher.update(&info.width.to_le_bytes());
@@ -241,29 +315,33 @@ fn encode_jpeg(raw: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn decode_jpeg(compressed: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+fn decode_jpeg_data(compressed: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     let mut decoder = Decoder::new(compressed);
     decoder.set_single_threaded(true);
     decoder.set_color_transform(ColorTransform::YCbCr);
     let raw = decoder
         .decode()
         .map_err(|error| Error::Decompression(error.to_string()))?;
-    let expected_width = u16::try_from(width)
-        .map_err(|_| Error::InvalidFormat("tile width exceeds JPEG limit".to_string()))?;
-    let expected_height = u16::try_from(height)
-        .map_err(|_| Error::InvalidFormat("tile height exceeds JPEG limit".to_string()))?;
-    let expected_len = width as usize * height as usize * 3;
     let info = decoder
         .info()
         .ok_or_else(|| Error::InvalidFormat("jpeg image info".to_string()))?;
-    if info.width != expected_width
-        || info.height != expected_height
-        || info.pixel_format != PixelFormat::RGB24
-        || raw.len() != expected_len
+    if info.pixel_format != PixelFormat::RGB24
+        || raw.len() != info.width as usize * info.height as usize * 3
     {
+        return Err(Error::InvalidFormat("jpeg tile format".to_string()));
+    }
+    Ok((raw, info.width as u32, info.height as u32))
+}
+
+fn decode_jpeg(compressed: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    if width > MAX_TILE_SIZE || height > MAX_TILE_SIZE {
         return Err(Error::InvalidFormat(
-            "jpeg tile dimensions or format".to_string(),
+            "tile width or height exceeds JPEG limit".to_string(),
         ));
+    }
+    let (raw, actual_width, actual_height) = decode_jpeg_data(compressed)?;
+    if actual_width != width || actual_height != height {
+        return Err(Error::InvalidFormat("jpeg tile dimensions".to_string()));
     }
     Ok(raw)
 }
@@ -313,8 +391,47 @@ pub struct Writer {
 
 impl Writer {
     pub fn create<P: AsRef<Path>>(path: P, width: u64, height: u64) -> Result<Self> {
-        let tile_size = DEFAULT_TILE_SIZE;
-        if width == 0 || height == 0 {
+        Self::create_with_tile_size(path, width, height, DEFAULT_TILE_SIZE)
+    }
+
+    pub fn create_from_jpeg_tiles<P: AsRef<Path>>(
+        path: P,
+        width: u64,
+        height: u64,
+        tile_size: u32,
+        tiles: &[Vec<Vec<u8>>],
+        rgb: &[u8],
+    ) -> Result<ImageInfo> {
+        let path = path.as_ref();
+        let temporary = temporary_path(path);
+        let result = (|| {
+            let mut writer = Self::create_with_tile_size(&temporary, width, height, tile_size)?;
+            writer.write_jpeg_tiles(tiles, rgb)?;
+            writer.finish()
+        })();
+        match result {
+            Ok(info) => {
+                if let Err(error) = fs::rename(&temporary, path) {
+                    let _ = fs::remove_file(&temporary);
+                    Err(Error::Io(error))
+                } else {
+                    Ok(info)
+                }
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn create_with_tile_size<P: AsRef<Path>>(
+        path: P,
+        width: u64,
+        height: u64,
+        tile_size: u32,
+    ) -> Result<Self> {
+        if width == 0 || height == 0 || tile_size == 0 || tile_size > MAX_TILE_SIZE {
             return Err(Error::InvalidFormat("image dimensions".to_string()));
         }
         let tiles_x = u32::try_from(width.div_ceil(tile_size as u64))
@@ -368,7 +485,7 @@ impl Writer {
         })
     }
 
-    pub fn write_tile(&mut self, x: u32, y: u32, raw: &[u8]) -> Result<()> {
+    fn tile_write_info(&self, x: u32, y: u32) -> Result<(u64, u32, u32)> {
         if x >= self.info.tiles_x || y >= self.info.tiles_y {
             return Err(Error::TileOutOfBounds);
         }
@@ -380,6 +497,83 @@ impl Writer {
             });
         }
         let (width, height) = tile_dimensions(&self.info, x, y);
+        Ok((id, width, height))
+    }
+
+    fn update_image_hash(&mut self, x: u32, y: u32, decoded: &[u8], stored_width: u32) {
+        let (visible_width, visible_height) = tile_dimensions(&self.info, x, y);
+        let stored_stride = stored_width as usize * 3;
+        let visible_row_length = visible_width as usize * 3;
+        for row in 0..visible_height as usize {
+            let start = row * stored_stride;
+            self.hasher
+                .update(&decoded[start..start + visible_row_length]);
+        }
+    }
+
+    fn write_compressed_tile(
+        &mut self,
+        x: u32,
+        y: u32,
+        id: u64,
+        compressed: &[u8],
+        decoded: &[u8],
+        stored_width: u32,
+    ) -> Result<()> {
+        let offset = self.file.stream_position()?;
+        self.file.write_all(compressed)?;
+        self.index[id as usize] = TileInfo {
+            offset,
+            compressed_size: compressed.len() as u64,
+            crc32c: crc32c::crc32c(decoded),
+        };
+        self.update_image_hash(x, y, decoded, stored_width);
+        self.next_tile += 1;
+        Ok(())
+    }
+
+    fn write_jpeg_tiles(&mut self, tiles: &[Vec<Vec<u8>>], rgb: &[u8]) -> Result<()> {
+        let expected_rgb = expected_rgb_length(&self.info)?;
+        if rgb.len() != expected_rgb {
+            return Err(Error::InvalidRgbLength {
+                actual: rgb.len(),
+                expected: expected_rgb,
+            });
+        }
+        if tiles.len() != self.info.tiles_y as usize {
+            return Err(Error::InvalidTileGrid {
+                actual_rows: tiles.len(),
+                expected_rows: self.info.tiles_y,
+                expected_columns: self.info.tiles_x,
+            });
+        }
+        for (y, row) in tiles.iter().enumerate() {
+            if row.len() != self.info.tiles_x as usize {
+                return Err(Error::InvalidTileRow {
+                    row: y,
+                    actual_columns: row.len(),
+                    expected_columns: self.info.tiles_x,
+                });
+            }
+            for (x, compressed) in row.iter().enumerate() {
+                let x = x as u32;
+                let y = y as u32;
+                let (id, _, _) = self.tile_write_info(x, y)?;
+                let (decoded, width, height) = decode_jpeg_data(compressed)?;
+                if !valid_tile_dimensions(&self.info, x, y, width, height) {
+                    return Err(Error::InvalidFormat("jpeg tile dimensions".to_string()));
+                }
+                if !tile_matches_rgb(&self.info, x, y, &decoded, width, rgb)? {
+                    return Err(Error::TileRgbMismatch { x, y });
+                }
+                self.write_compressed_tile(x, y, id, compressed, &decoded, width)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_tile(&mut self, x: u32, y: u32, raw: &[u8]) -> Result<()> {
+        let (id, width, height) = self.tile_write_info(x, y)?;
         let expected = width as usize * height as usize * 3;
         if raw.len() != expected {
             return Err(Error::InvalidTileLength {
@@ -389,16 +583,7 @@ impl Writer {
         }
         let compressed = encode_jpeg(raw, width, height)?;
         let decoded = decode_jpeg(&compressed, width, height)?;
-        let offset = self.file.stream_position()?;
-        self.file.write_all(&compressed)?;
-        self.index[id as usize] = TileInfo {
-            offset,
-            compressed_size: compressed.len() as u64,
-            crc32c: crc32c::crc32c(&decoded),
-        };
-        self.hasher.update(&decoded);
-        self.next_tile += 1;
-        Ok(())
+        self.write_compressed_tile(x, y, id, &compressed, &decoded, width)
     }
 
     pub fn finish(mut self) -> Result<ImageInfo> {
@@ -504,13 +689,15 @@ impl Reader {
         y: u32,
         compressed: &[u8],
         entry: TileInfo,
-    ) -> Result<Vec<u8>> {
-        let (width, height) = tile_dimensions(&self.inner.header.info, x, y);
-        let raw = decode_jpeg(compressed, width, height)?;
+    ) -> Result<(Vec<u8>, u32, u32)> {
+        let (raw, width, height) = decode_jpeg_data(compressed)?;
+        if !valid_tile_dimensions(&self.inner.header.info, x, y, width, height) {
+            return Err(Error::InvalidFormat("jpeg tile dimensions".to_string()));
+        }
         if crc32c::crc32c(&raw) != entry.crc32c {
             return Err(Error::ChecksumMismatch);
         }
-        Ok(raw)
+        Ok((raw, width, height))
     }
 
     pub fn read(&self, x: u64, y: u64, width: u32, height: u32) -> Result<Region> {
@@ -546,8 +733,9 @@ impl Reader {
                 .map(|job| {
                     let start = (job.3.offset - batch.start) as usize;
                     let end = start + job.3.compressed_size as usize;
-                    let data = self.decode_tile_bytes(job.0, job.1, &block[start..end], job.3)?;
-                    Ok::<_, Error>((job.0, job.1, data))
+                    let (data, width, height) =
+                        self.decode_tile_bytes(job.0, job.1, &block[start..end], job.3)?;
+                    Ok::<_, Error>((job.0, job.1, data, width, height))
                 })
                 .collect::<Vec<_>>();
             for part in parts {
@@ -556,9 +744,9 @@ impl Reader {
         }
         let stride = width as usize * 3;
         let mut output = vec![0u8; stride * height as usize];
-        for (tx, ty, tile) in decoded {
+        for (tx, ty, tile, stored_w, _stored_h) in decoded {
             let (tile_w, tile_h) = tile_dimensions(&self.inner.header.info, tx, ty);
-            let src_stride = tile_w as usize * 3;
+            let src_stride = stored_w as usize * 3;
             let tile_origin_x = tx as u64 * self.inner.header.info.tile_size as u64;
             let tile_origin_y = ty as u64 * self.inner.header.info.tile_size as u64;
             let copy_x = tile_origin_x.saturating_sub(x) as usize;
@@ -645,7 +833,10 @@ fn base32_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_jpeg, encode_jpeg};
+    use super::{
+        Error, HEADER_SIZE, Header, Reader, Writer, decode_jpeg, decode_jpeg_data, encode_jpeg,
+    };
+    use std::fs;
 
     #[test]
     fn jpeg_rgb_round_trip() {
@@ -660,6 +851,71 @@ mod tests {
                 assert!((*actual as i16 - expected as i16).abs() <= 5);
             }
         }
+    }
+
+    #[test]
+    fn jpeg_tiles_conversion_preserves_compressed_bytes() {
+        let path = std::env::temp_dir().join(format!("fwsi-jpeg-tiles-{}", std::process::id()));
+        let raw = [255u8, 0, 0].repeat(32 * 32);
+        let compressed = encode_jpeg(&raw, 32, 32).unwrap();
+        let rgb = decode_jpeg(&compressed, 32, 32).unwrap();
+        let info =
+            Writer::create_from_jpeg_tiles(&path, 32, 32, 1024, &[vec![compressed.clone()]], &rgb)
+                .unwrap();
+        let archive = fs::read(&path).unwrap();
+        let header = Header::decode(&archive[..HEADER_SIZE].try_into().unwrap()).unwrap();
+        assert_eq!(
+            &archive[header.data_offset as usize..],
+            compressed.as_slice()
+        );
+
+        let reader = Reader::open(&path).unwrap();
+        assert_eq!(reader.info().image_hash, info.image_hash);
+        assert_eq!(
+            reader.read(0, 0, 32, 32).unwrap().data,
+            decode_jpeg(&compressed, 32, 32).unwrap()
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn jpeg_tiles_conversion_rejects_rgb_mismatch() {
+        let path = std::env::temp_dir().join(format!("fwsi-jpeg-mismatch-{}", std::process::id()));
+        let compressed = encode_jpeg(&[255u8, 0, 0].repeat(32 * 32), 32, 32).unwrap();
+        let mut rgb = decode_jpeg(&compressed, 32, 32).unwrap();
+        rgb[0] ^= 1;
+        let result = Writer::create_from_jpeg_tiles(&path, 32, 32, 1024, &[vec![compressed]], &rgb);
+        assert!(matches!(result, Err(Error::TileRgbMismatch { x: 0, y: 0 })));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn padded_edge_jpeg_tiles_are_cropped() {
+        let path = std::env::temp_dir().join(format!("fwsi-padded-edge-{}", std::process::id()));
+        let red = encode_jpeg(&[255u8, 0, 0].repeat(256 * 256), 256, 256).unwrap();
+        let green = encode_jpeg(&[0u8, 255, 0].repeat(256 * 256), 256, 256).unwrap();
+        let (red_rgb, _, _) = decode_jpeg_data(&red).unwrap();
+        let (green_rgb, _, _) = decode_jpeg_data(&green).unwrap();
+        let mut rgb = vec![0u8; 300 * 250 * 3];
+        for row in 0..250 {
+            let rgb_start = row * 300 * 3;
+            let red_start = row * 256 * 3;
+            rgb[rgb_start..rgb_start + 256 * 3]
+                .copy_from_slice(&red_rgb[red_start..red_start + 256 * 3]);
+            rgb[rgb_start + 256 * 3..rgb_start + 300 * 3]
+                .copy_from_slice(&green_rgb[red_start..red_start + 44 * 3]);
+        }
+        Writer::create_from_jpeg_tiles(&path, 300, 250, 256, &[vec![red, green]], &rgb).unwrap();
+
+        let reader = Reader::open(&path).unwrap();
+        let region = reader.read(255, 249, 2, 1).unwrap();
+        assert_eq!(region.data.len(), 2 * 3);
+        let expected_start = (249 * 300 + 255) * 3;
+        assert_eq!(
+            region.data,
+            rgb[expected_start..expected_start + 2 * 3].to_vec()
+        );
+        fs::remove_file(path).unwrap();
     }
 }
 
