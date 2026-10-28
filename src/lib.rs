@@ -220,10 +220,18 @@ fn tile_dimensions(info: &ImageInfo, x: u32, y: u32) -> (u32, u32) {
     (w, h)
 }
 
+fn valid_tile_dimension(visible: u32, tile_size: u32, actual: u32) -> bool {
+    if visible == tile_size {
+        actual == tile_size
+    } else {
+        actual > 0 && (actual <= visible || actual == tile_size)
+    }
+}
+
 fn valid_tile_dimensions(info: &ImageInfo, x: u32, y: u32, width: u32, height: u32) -> bool {
     let (visible_width, visible_height) = tile_dimensions(info, x, y);
-    (width == visible_width || width == info.tile_size)
-        && (height == visible_height || height == info.tile_size)
+    valid_tile_dimension(visible_width, info.tile_size, width)
+        && valid_tile_dimension(visible_height, info.tile_size, height)
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -457,14 +465,28 @@ impl Writer {
         Ok((id, width, height))
     }
 
-    fn update_image_hash(&mut self, x: u32, y: u32, decoded: &[u8], stored_width: u32) {
+    fn update_image_hash(
+        &mut self,
+        x: u32,
+        y: u32,
+        decoded: &[u8],
+        stored_width: u32,
+        stored_height: u32,
+    ) {
         let (visible_width, visible_height) = tile_dimensions(&self.info, x, y);
         let stored_stride = stored_width as usize * 3;
         let visible_row_length = visible_width as usize * 3;
+        let zeros = vec![0u8; visible_row_length];
         for row in 0..visible_height as usize {
-            let start = row * stored_stride;
-            self.hasher
-                .update(&decoded[start..start + visible_row_length]);
+            if row < stored_height as usize {
+                let available_width = stored_width.min(visible_width) as usize;
+                let start = row * stored_stride;
+                self.hasher
+                    .update(&decoded[start..start + available_width * 3]);
+                self.hasher.update(&zeros[available_width * 3..]);
+            } else {
+                self.hasher.update(&zeros);
+            }
         }
     }
 
@@ -472,11 +494,12 @@ impl Writer {
         &mut self,
         x: u32,
         y: u32,
-        id: u64,
         compressed: &[u8],
         decoded: &[u8],
         stored_width: u32,
+        stored_height: u32,
     ) -> Result<()> {
+        let id = y as u64 * self.info.tiles_x as u64 + x as u64;
         let offset = self.file.stream_position()?;
         self.file.write_all(compressed)?;
         self.index[id as usize] = TileInfo {
@@ -484,7 +507,7 @@ impl Writer {
             compressed_size: compressed.len() as u64,
             crc32c: crc32c::crc32c(decoded),
         };
-        self.update_image_hash(x, y, decoded, stored_width);
+        self.update_image_hash(x, y, decoded, stored_width, stored_height);
         self.next_tile += 1;
         Ok(())
     }
@@ -508,19 +531,19 @@ impl Writer {
             for (x, compressed) in row.iter().enumerate() {
                 let x = x as u32;
                 let y = y as u32;
-                let (id, _, _) = self.tile_write_info(x, y)?;
+                self.tile_write_info(x, y)?;
                 let (decoded, width, height) = decode_jpeg_data(compressed)?;
                 if !valid_tile_dimensions(&self.info, x, y, width, height) {
                     return Err(Error::InvalidFormat("jpeg tile dimensions".to_string()));
                 }
-                self.write_compressed_tile(x, y, id, compressed, &decoded, width)?;
+                self.write_compressed_tile(x, y, compressed, &decoded, width, height)?;
             }
         }
         Ok(())
     }
 
     pub fn write_tile(&mut self, x: u32, y: u32, raw: &[u8]) -> Result<()> {
-        let (id, width, height) = self.tile_write_info(x, y)?;
+        let (_, width, height) = self.tile_write_info(x, y)?;
         let expected = width as usize * height as usize * 3;
         if raw.len() != expected {
             return Err(Error::InvalidTileLength {
@@ -530,7 +553,7 @@ impl Writer {
         }
         let compressed = encode_jpeg(raw, width, height)?;
         let decoded = decode_jpeg(&compressed, width, height)?;
-        self.write_compressed_tile(x, y, id, &compressed, &decoded, width)
+        self.write_compressed_tile(x, y, &compressed, &decoded, width, height)
     }
 
     pub fn finish(mut self) -> Result<ImageInfo> {
@@ -691,7 +714,7 @@ impl Reader {
         }
         let stride = width as usize * 3;
         let mut output = vec![0u8; stride * height as usize];
-        for (tx, ty, tile, stored_w, _stored_h) in decoded {
+        for (tx, ty, tile, stored_w, stored_h) in decoded {
             let (tile_w, tile_h) = tile_dimensions(&self.inner.header.info, tx, ty);
             let src_stride = stored_w as usize * 3;
             let tile_origin_x = tx as u64 * self.inner.header.info.tile_size as u64;
@@ -702,10 +725,12 @@ impl Reader {
             let src_start_y = y.saturating_sub(tile_origin_y) as usize;
             let visible_w = tile_w
                 .saturating_sub(src_start_x as u32)
-                .min(width.saturating_sub(copy_x as u32));
+                .min(width.saturating_sub(copy_x as u32))
+                .min(stored_w.saturating_sub(src_start_x as u32));
             let visible_h = tile_h
                 .saturating_sub(src_start_y as u32)
-                .min(height.saturating_sub(copy_y as u32));
+                .min(height.saturating_sub(copy_y as u32))
+                .min(stored_h.saturating_sub(src_start_y as u32));
             for row in 0..visible_h as usize {
                 let src = (src_start_y + row) * src_stride + src_start_x * 3;
                 let dst = (copy_y + row) * stride + copy_x * 3;
@@ -780,7 +805,7 @@ fn base32_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEADER_SIZE, Header, Reader, Writer, decode_jpeg, encode_jpeg};
+    use super::{Error, HEADER_SIZE, Header, Reader, Writer, decode_jpeg, encode_jpeg};
     use std::fs;
 
     #[test]
@@ -857,6 +882,37 @@ mod tests {
         expected.extend_from_slice(&green_rgb[green_start..green_start + 3]);
         assert_eq!(region.data, expected);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn partially_covered_edge_jpeg_tiles_are_blank_after_coverage() {
+        let path = std::env::temp_dir().join(format!("fwsi-partial-edge-{}", std::process::id()));
+        let red = encode_jpeg(&[255u8, 0, 0].repeat(256 * 13), 256, 13).unwrap();
+        let green = encode_jpeg(&[0u8, 255, 0].repeat(44 * 13), 44, 13).unwrap();
+        let red_rgb = decode_jpeg(&red, 256, 13).unwrap();
+        let green_rgb = decode_jpeg(&green, 44, 13).unwrap();
+        Writer::create_from_jpeg_tiles(&path, 300, 250, 256, &[vec![red, green]]).unwrap();
+
+        let reader = Reader::open(&path).unwrap();
+        let region = reader.read(255, 12, 2, 2).unwrap();
+        let red_start = (12 * 256 + 255) * 3;
+        let green_start = 12 * 44 * 3;
+        let mut expected = red_rgb[red_start..red_start + 3].to_vec();
+        expected.extend_from_slice(&green_rgb[green_start..green_start + 3]);
+        expected.extend_from_slice(&[0u8; 6]);
+        assert_eq!(region.data, expected);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn partially_covered_interior_jpeg_tiles_are_rejected() {
+        let path =
+            std::env::temp_dir().join(format!("fwsi-partial-interior-{}", std::process::id()));
+        let partial = encode_jpeg(&[255u8, 0, 0].repeat(256 * 13), 256, 13).unwrap();
+        let full = encode_jpeg(&[0u8, 255, 0].repeat(256 * 256), 256, 256).unwrap();
+        let result = Writer::create_from_jpeg_tiles(&path, 512, 256, 256, &[vec![partial, full]]);
+        assert!(matches!(result, Err(Error::InvalidFormat(_))));
+        assert!(!path.exists());
     }
 }
 

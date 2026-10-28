@@ -155,7 +155,7 @@ let info = fwsi::Writer::create_from_jpeg_tiles(
 )?;
 ```
 
-The archive keeps the supplied JPEG bytes and does not encode them again. Interior blocks must use the archive tile size. Edge blocks may use either their visible dimensions or the full padded tile dimensions.
+The archive keeps the supplied JPEG bytes and does not encode them again. Interior blocks must use the archive tile size. Edge blocks may use any positive dimensions up to their visible dimensions for partial coverage, or the full padded tile dimensions. Pixels outside a partially covered block are returned as zero RGB bytes.
 
 ## Reading images
 
