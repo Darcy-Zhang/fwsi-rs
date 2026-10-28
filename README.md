@@ -129,7 +129,7 @@ The length of each tile buffer must be:
 tile_width x tile_height x 3
 ```
 
-When JPEG tiles are already encoded, convert the complete tile grid with the RGB reference:
+When JPEG tiles are already encoded, convert the complete tile grid directly:
 
 ```python
 info = fwsi.Writer.create_from_jpeg_tiles(
@@ -138,11 +138,10 @@ info = fwsi.Writer.create_from_jpeg_tiles(
     image_height,
     tile_size,
     tiles,
-    rgb_bytes,
 )
 ```
 
-`tiles[y][x]` contains one JPEG tile as `bytes`. `rgb_bytes` is the expected decoded result for the complete logical image in tightly packed RGB8 order, not the pre-JPEG source pixels. Each decoded JPEG tile is checked against its corresponding RGB pixels before the archive is finalized. Edge padding is ignored during comparison and reads are cropped to the original image dimensions.
+`tiles[y][x]` contains one JPEG tile as `bytes`. The JPEG bytes are decoded only for the archive checksum and image hash; no external RGB buffer is required. Edge padding is ignored when reading and reads are cropped to the original image dimensions.
 
 The equivalent Rust call is:
 
@@ -153,7 +152,6 @@ let info = fwsi::Writer::create_from_jpeg_tiles(
     image_height,
     tile_size,
     &tiles,
-    &rgb_bytes,
 )?;
 ```
 

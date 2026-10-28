@@ -103,7 +103,7 @@ impl PyWriter {
         })
     }
     #[staticmethod]
-    #[pyo3(signature = (path, width, height, tile_size, tiles, rgb))]
+    #[pyo3(signature = (path, width, height, tile_size, tiles))]
     fn create_from_jpeg_tiles(
         py: Python<'_>,
         path: String,
@@ -111,7 +111,6 @@ impl PyWriter {
         height: u64,
         tile_size: u32,
         tiles: Vec<Vec<Py<PyBytes>>>,
-        rgb: &Bound<'_, PyBytes>,
     ) -> PyResult<PyImageInfo> {
         let tiles = tiles
             .into_iter()
@@ -121,10 +120,8 @@ impl PyWriter {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let rgb = rgb.as_bytes().to_vec();
         let info = py.detach(|| {
-            Writer::create_from_jpeg_tiles(path, width, height, tile_size, &tiles, &rgb)
-                .map_err(py_err)
+            Writer::create_from_jpeg_tiles(path, width, height, tile_size, &tiles).map_err(py_err)
         })?;
         Ok(PyImageInfo { inner: info })
     }

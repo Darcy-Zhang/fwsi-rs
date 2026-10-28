@@ -50,10 +50,6 @@ pub enum Error {
         actual_columns: usize,
         expected_columns: u32,
     },
-    #[error("RGB data has length {actual}, expected {expected}")]
-    InvalidRgbLength { actual: usize, expected: usize },
-    #[error("tile RGB data does not match at ({x}, {y})")]
-    TileRgbMismatch { x: u32, y: u32 },
     #[error("tile checksum mismatch")]
     ChecksumMismatch,
     #[error("header checksum mismatch")]
@@ -230,44 +226,6 @@ fn valid_tile_dimensions(info: &ImageInfo, x: u32, y: u32, width: u32, height: u
         && (height == visible_height || height == info.tile_size)
 }
 
-fn expected_rgb_length(info: &ImageInfo) -> Result<usize> {
-    let pixels = info
-        .width
-        .checked_mul(info.height)
-        .ok_or_else(|| Error::InvalidFormat("RGB dimensions".to_string()))?;
-    let length = pixels
-        .checked_mul(3)
-        .ok_or_else(|| Error::InvalidFormat("RGB dimensions".to_string()))?;
-    usize::try_from(length).map_err(|_| Error::InvalidFormat("RGB dimensions".to_string()))
-}
-
-fn tile_matches_rgb(
-    info: &ImageInfo,
-    x: u32,
-    y: u32,
-    decoded: &[u8],
-    stored_width: u32,
-    rgb: &[u8],
-) -> Result<bool> {
-    let (visible_width, visible_height) = tile_dimensions(info, x, y);
-    let image_width = usize::try_from(info.width)
-        .map_err(|_| Error::InvalidFormat("RGB dimensions".to_string()))?;
-    let tile_origin_x = x as usize * info.tile_size as usize;
-    let tile_origin_y = y as usize * info.tile_size as usize;
-    let stored_stride = stored_width as usize * 3;
-    let visible_row_length = visible_width as usize * 3;
-    for row in 0..visible_height as usize {
-        let decoded_start = row * stored_stride;
-        let rgb_start = ((tile_origin_y + row) * image_width + tile_origin_x) * 3;
-        if decoded[decoded_start..decoded_start + visible_row_length]
-            != rgb[rgb_start..rgb_start + visible_row_length]
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 fn temporary_path(path: &Path) -> PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut temporary = path.as_os_str().to_os_string();
@@ -400,13 +358,12 @@ impl Writer {
         height: u64,
         tile_size: u32,
         tiles: &[Vec<Vec<u8>>],
-        rgb: &[u8],
     ) -> Result<ImageInfo> {
         let path = path.as_ref();
         let temporary = temporary_path(path);
         let result = (|| {
             let mut writer = Self::create_with_tile_size(&temporary, width, height, tile_size)?;
-            writer.write_jpeg_tiles(tiles, rgb)?;
+            writer.write_jpeg_tiles(tiles)?;
             writer.finish()
         })();
         match result {
@@ -532,14 +489,7 @@ impl Writer {
         Ok(())
     }
 
-    fn write_jpeg_tiles(&mut self, tiles: &[Vec<Vec<u8>>], rgb: &[u8]) -> Result<()> {
-        let expected_rgb = expected_rgb_length(&self.info)?;
-        if rgb.len() != expected_rgb {
-            return Err(Error::InvalidRgbLength {
-                actual: rgb.len(),
-                expected: expected_rgb,
-            });
-        }
+    fn write_jpeg_tiles(&mut self, tiles: &[Vec<Vec<u8>>]) -> Result<()> {
         if tiles.len() != self.info.tiles_y as usize {
             return Err(Error::InvalidTileGrid {
                 actual_rows: tiles.len(),
@@ -562,9 +512,6 @@ impl Writer {
                 let (decoded, width, height) = decode_jpeg_data(compressed)?;
                 if !valid_tile_dimensions(&self.info, x, y, width, height) {
                     return Err(Error::InvalidFormat("jpeg tile dimensions".to_string()));
-                }
-                if !tile_matches_rgb(&self.info, x, y, &decoded, width, rgb)? {
-                    return Err(Error::TileRgbMismatch { x, y });
                 }
                 self.write_compressed_tile(x, y, id, compressed, &decoded, width)?;
             }
@@ -833,9 +780,7 @@ fn base32_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Error, HEADER_SIZE, Header, Reader, Writer, decode_jpeg, decode_jpeg_data, encode_jpeg,
-    };
+    use super::{HEADER_SIZE, Header, Reader, Writer, decode_jpeg, encode_jpeg};
     use std::fs;
 
     #[test]
@@ -858,10 +803,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("fwsi-jpeg-tiles-{}", std::process::id()));
         let raw = [255u8, 0, 0].repeat(32 * 32);
         let compressed = encode_jpeg(&raw, 32, 32).unwrap();
-        let rgb = decode_jpeg(&compressed, 32, 32).unwrap();
-        let info =
-            Writer::create_from_jpeg_tiles(&path, 32, 32, 1024, &[vec![compressed.clone()]], &rgb)
-                .unwrap();
+        let info = Writer::create_from_jpeg_tiles(&path, 32, 32, 1024, &[vec![compressed.clone()]])
+            .unwrap();
         let archive = fs::read(&path).unwrap();
         let header = Header::decode(&archive[..HEADER_SIZE].try_into().unwrap()).unwrap();
         assert_eq!(
@@ -879,42 +822,21 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_tiles_conversion_rejects_rgb_mismatch() {
-        let path = std::env::temp_dir().join(format!("fwsi-jpeg-mismatch-{}", std::process::id()));
-        let compressed = encode_jpeg(&[255u8, 0, 0].repeat(32 * 32), 32, 32).unwrap();
-        let mut rgb = decode_jpeg(&compressed, 32, 32).unwrap();
-        rgb[0] ^= 1;
-        let result = Writer::create_from_jpeg_tiles(&path, 32, 32, 1024, &[vec![compressed]], &rgb);
-        assert!(matches!(result, Err(Error::TileRgbMismatch { x: 0, y: 0 })));
-        assert!(!path.exists());
-    }
-
-    #[test]
     fn padded_edge_jpeg_tiles_are_cropped() {
         let path = std::env::temp_dir().join(format!("fwsi-padded-edge-{}", std::process::id()));
         let red = encode_jpeg(&[255u8, 0, 0].repeat(256 * 256), 256, 256).unwrap();
         let green = encode_jpeg(&[0u8, 255, 0].repeat(256 * 256), 256, 256).unwrap();
-        let (red_rgb, _, _) = decode_jpeg_data(&red).unwrap();
-        let (green_rgb, _, _) = decode_jpeg_data(&green).unwrap();
-        let mut rgb = vec![0u8; 300 * 250 * 3];
-        for row in 0..250 {
-            let rgb_start = row * 300 * 3;
-            let red_start = row * 256 * 3;
-            rgb[rgb_start..rgb_start + 256 * 3]
-                .copy_from_slice(&red_rgb[red_start..red_start + 256 * 3]);
-            rgb[rgb_start + 256 * 3..rgb_start + 300 * 3]
-                .copy_from_slice(&green_rgb[red_start..red_start + 44 * 3]);
-        }
-        Writer::create_from_jpeg_tiles(&path, 300, 250, 256, &[vec![red, green]], &rgb).unwrap();
+        let red_rgb = decode_jpeg(&red, 256, 256).unwrap();
+        let green_rgb = decode_jpeg(&green, 256, 256).unwrap();
+        Writer::create_from_jpeg_tiles(&path, 300, 250, 256, &[vec![red, green]]).unwrap();
 
         let reader = Reader::open(&path).unwrap();
         let region = reader.read(255, 249, 2, 1).unwrap();
-        assert_eq!(region.data.len(), 2 * 3);
-        let expected_start = (249 * 300 + 255) * 3;
-        assert_eq!(
-            region.data,
-            rgb[expected_start..expected_start + 2 * 3].to_vec()
-        );
+        let red_start = (249 * 256 + 255) * 3;
+        let green_start = (249 * 256) * 3;
+        let mut expected = red_rgb[red_start..red_start + 3].to_vec();
+        expected.extend_from_slice(&green_rgb[green_start..green_start + 3]);
+        assert_eq!(region.data, expected);
         fs::remove_file(path).unwrap();
     }
 }
