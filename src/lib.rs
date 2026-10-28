@@ -839,6 +839,25 @@ mod tests {
         assert_eq!(region.data, expected);
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn unpadded_edge_jpeg_tiles_are_cropped() {
+        let path = std::env::temp_dir().join(format!("fwsi-unpadded-edge-{}", std::process::id()));
+        let red = encode_jpeg(&[255u8, 0, 0].repeat(256 * 250), 256, 250).unwrap();
+        let green = encode_jpeg(&[0u8, 255, 0].repeat(44 * 250), 44, 250).unwrap();
+        let red_rgb = decode_jpeg(&red, 256, 250).unwrap();
+        let green_rgb = decode_jpeg(&green, 44, 250).unwrap();
+        Writer::create_from_jpeg_tiles(&path, 300, 250, 256, &[vec![red, green]]).unwrap();
+
+        let reader = Reader::open(&path).unwrap();
+        let region = reader.read(255, 249, 2, 1).unwrap();
+        let red_start = (249 * 256 + 255) * 3;
+        let green_start = 249 * 44 * 3;
+        let mut expected = red_rgb[red_start..red_start + 3].to_vec();
+        expected.extend_from_slice(&green_rgb[green_start..green_start + 3]);
+        assert_eq!(region.data, expected);
+        fs::remove_file(path).unwrap();
+    }
 }
 
 #[cfg(feature = "python")]
