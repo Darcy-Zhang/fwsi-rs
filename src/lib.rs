@@ -1,6 +1,6 @@
 use blake3::Hasher;
 use rayon::prelude::*;
-use rusty_jpeg::decode::{ColorTransform, Decoder, PixelFormat};
+use rusty_jpeg::decode::{Decoder, PixelFormat};
 use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -284,7 +284,6 @@ fn encode_jpeg(raw: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
 fn decode_jpeg_data(compressed: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     let mut decoder = Decoder::new(compressed);
     decoder.set_single_threaded(true);
-    decoder.set_color_transform(ColorTransform::YCbCr);
     let raw = decoder
         .decode()
         .map_err(|error| Error::Decompression(error.to_string()))?;
