@@ -129,6 +129,28 @@ The length of each tile buffer must be:
 tile_width x tile_height x 3
 ```
 
+Rust callers can prepare tiles concurrently with `PreparedTile::encode`, then append them in row-major order with `Writer::write_prepared_tile`. Preparation performs JPEG encoding, decoding, and CRC calculation without borrowing the writer; appending updates the image hash and writes the prepared bytes without encoding or decoding again. Tile dimensions must match their visible image region, including smaller edge tiles.
+
+This example uses Rayon in the calling application:
+
+```rust
+use fwsi::{PreparedTile, Writer};
+use rayon::prelude::*;
+
+let inputs = [(256, vec![255; 256 * 17 * 3]), (1, vec![0; 17 * 3])];
+let prepared = inputs
+    .par_iter()
+    .map(|(width, rgb)| PreparedTile::encode(rgb, *width, 17))
+    .collect::<fwsi::Result<Vec<_>>>()?;
+let mut writer = Writer::create_with_tile_size("parallel.fwsi", 257, 17, 256)?;
+for (x, tile) in prepared.into_iter().enumerate() {
+    writer.write_prepared_tile(x as u32, 0, tile)?;
+}
+let info = writer.finish()?;
+```
+
+Each prepared tile owns its JPEG bytes and decoded RGB buffer. For large images, use bounded batches instead of preparing the entire image at once. The archive format, image hash, and checksums are the same as with `write_tile`.
+
 When JPEG tiles are already encoded, convert the complete tile grid directly:
 
 ```python

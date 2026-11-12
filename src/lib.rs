@@ -345,6 +345,42 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     Ok(())
 }
 
+pub struct PreparedTile {
+    compressed: Vec<u8>,
+    decoded: Vec<u8>,
+    width: u32,
+    height: u32,
+    crc32c: u32,
+}
+
+impl PreparedTile {
+    pub fn encode(raw: &[u8], width: u32, height: u32) -> Result<Self> {
+        if width == 0 || height == 0 || width > MAX_TILE_SIZE || height > MAX_TILE_SIZE {
+            return Err(Error::InvalidFormat("tile dimensions".to_string()));
+        }
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| Error::InvalidFormat("tile byte length".to_string()))?;
+        if raw.len() != expected {
+            return Err(Error::InvalidTileLength {
+                actual: raw.len(),
+                expected,
+            });
+        }
+        let compressed = encode_jpeg(raw, width, height)?;
+        let decoded = decode_jpeg(&compressed, width, height)?;
+        let crc32c = crc32c::crc32c(&decoded);
+        Ok(Self {
+            compressed,
+            decoded,
+            width,
+            height,
+            crc32c,
+        })
+    }
+}
+
 pub struct Writer {
     file: File,
     info: ImageInfo,
@@ -495,8 +531,8 @@ impl Writer {
         y: u32,
         compressed: &[u8],
         decoded: &[u8],
-        stored_width: u32,
-        stored_height: u32,
+        dimensions: (u32, u32),
+        crc32c: u32,
     ) -> Result<()> {
         let id = y as u64 * self.info.tiles_x as u64 + x as u64;
         let offset = self.file.stream_position()?;
@@ -504,9 +540,9 @@ impl Writer {
         self.index[id as usize] = TileInfo {
             offset,
             compressed_size: compressed.len() as u64,
-            crc32c: crc32c::crc32c(decoded),
+            crc32c,
         };
-        self.update_image_hash(x, y, decoded, stored_width, stored_height);
+        self.update_image_hash(x, y, decoded, dimensions.0, dimensions.1);
         self.next_tile += 1;
         Ok(())
     }
@@ -535,7 +571,8 @@ impl Writer {
                 if !valid_tile_dimensions(&self.info, x, y, width, height) {
                     return Err(Error::InvalidFormat("jpeg tile dimensions".to_string()));
                 }
-                self.write_compressed_tile(x, y, compressed, &decoded, width, height)?;
+                let crc32c = crc32c::crc32c(&decoded);
+                self.write_compressed_tile(x, y, compressed, &decoded, (width, height), crc32c)?;
             }
         }
         Ok(())
@@ -543,16 +580,27 @@ impl Writer {
 
     pub fn write_tile(&mut self, x: u32, y: u32, raw: &[u8]) -> Result<()> {
         let (_, width, height) = self.tile_write_info(x, y)?;
-        let expected = width as usize * height as usize * 3;
-        if raw.len() != expected {
-            return Err(Error::InvalidTileLength {
-                actual: raw.len(),
-                expected,
-            });
+        let tile = PreparedTile::encode(raw, width, height)?;
+        self.append_prepared_tile(x, y, tile)
+    }
+
+    pub fn write_prepared_tile(&mut self, x: u32, y: u32, tile: PreparedTile) -> Result<()> {
+        let (_, width, height) = self.tile_write_info(x, y)?;
+        if tile.width != width || tile.height != height {
+            return Err(Error::InvalidFormat("prepared tile dimensions".to_string()));
         }
-        let compressed = encode_jpeg(raw, width, height)?;
-        let decoded = decode_jpeg(&compressed, width, height)?;
-        self.write_compressed_tile(x, y, &compressed, &decoded, width, height)
+        self.append_prepared_tile(x, y, tile)
+    }
+
+    fn append_prepared_tile(&mut self, x: u32, y: u32, tile: PreparedTile) -> Result<()> {
+        self.write_compressed_tile(
+            x,
+            y,
+            &tile.compressed,
+            &tile.decoded,
+            (tile.width, tile.height),
+            tile.crc32c,
+        )
     }
 
     pub fn finish(mut self) -> Result<ImageInfo> {
